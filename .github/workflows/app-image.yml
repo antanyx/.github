@@ -1,0 +1,100 @@
+# Workflow reutilizable de la organización: verifica una app de la plataforma, construye su
+# imagen Docker en GitHub Actions (nunca en el servidor), la publica en GHCR y, si hay hook,
+# la despliega. La misma imagen sirve para demo (Render) y producción (Coolify en Hetzner).
+#
+# Uso desde una app:  uses: antanyx/.github/.github/workflows/app-image.yml@main
+name: App → imagen → despliegue
+
+on:
+  workflow_call:
+    inputs:
+      deploy:
+        description: Desplegar tras publicar la imagen (normalmente solo en main)
+        type: boolean
+        default: false
+      node-version:
+        type: string
+        default: "24"
+    secrets:
+      PACKAGES_TOKEN:
+        description: >-
+          Opcional. PAT (classic) con read:packages para @antanyx/*. Sin él se usa el
+          GITHUB_TOKEN del repo, que basta si cada paquete da acceso al repo en
+          Package settings → Manage Actions access.
+        required: false
+      DEPLOY_HOOK:
+        description: Deploy hook de Render o webhook de Coolify (secreto del repo)
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: "@antanyx"
+      - run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+      - run: npm run build
+      - run: npm test --if-present
+
+  image:
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # El token solo existe en el paso `npm ci` del Dockerfile: no queda en la imagen.
+          secrets: npm_token=${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    if: inputs.deploy && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disparar el despliegue de la imagen exacta (por digest)
+        env:
+          HOOK: ${{ secrets.DEPLOY_HOOK }}
+          IMAGE: ghcr.io/${{ github.repository }}@${{ needs.image.outputs.digest }}
+        run: |
+          if [ -z "$HOOK" ]; then echo "Sin DEPLOY_HOOK: imagen publicada, no se despliega."; exit 0; fi
+          image=$(printf '%s' "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          encoded=$(jq -rn --arg v "$image" '$v|@uri')
+          sep='?'; case "$HOOK" in *\?*) sep='&';; esac
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${HOOK}${sep}imgURL=${encoded}")
+          echo "Despliegue solicitado ($code): $image" >> "$GITHUB_STEP_SUMMARY"
+          case "$code" in 200|201|202) ;; *) echo "El hook respondió $code"; exit 1;; esac
